@@ -18,6 +18,7 @@
         "test:watch": "vitest"
     },
     "dependencies": {
+        "@dotdm/contracts": "latest",
         "@polkadot-api/sdk-ink": "^0.6.2",
         "@polkadot-apps/address": "latest",
         "@polkadot-apps/bulletin": "latest",
@@ -46,6 +47,11 @@
     "pnpm": {
         "onlyBuiltDependencies": [
             "@biomejs/biome"
-        ]
+        ],
+        "overrides": {
+            "@dotdm/contracts": "link:../contract-dependency-manager/src/lib/contracts",
+            "@dotdm/env": "link:../contract-dependency-manager/src/lib/env",
+            "@dotdm/utils": "link:../contract-dependency-manager/src/lib/utils"
+        }
     }
 }

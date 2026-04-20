@@ -44,7 +44,7 @@ export interface DeploySignerSetup {
 }
 
 export interface DeployApproval {
-    phase: "dotns" | "playground";
+    phase: "contracts" | "dotns" | "playground";
     label: string;
 }
 
@@ -62,6 +62,14 @@ export interface ResolveOptions {
      * we under-estimated, so users never see "step 5 of 4" even on this path.
      */
     plan?: DeployPlan;
+    /**
+     * Dependency-sorted layers of ink! contract crates that will be deployed
+     * before the frontend upload. Each layer corresponds to two phone taps —
+     * one combined deploy+register batch on AssetHub and one publish batch on
+     * Bulletin — plus an optional Bulletin-side metadata upload. Omit when the
+     * project has no contracts.
+     */
+    contractLayers?: string[][];
 }
 
 /**
@@ -99,10 +107,49 @@ function dotnsApprovals(plan: DeployPlan | undefined): DeployApproval[] {
     return approvals;
 }
 
+/**
+ * Per-layer contract approvals in cdm's firing order. Each layer is one
+ * deploy+register batch on AssetHub (combined via `Utility.batch_all`) and one
+ * publish batch on Bulletin — two taps per layer regardless of contract count,
+ * which is exactly what keeps mobile-signed deploys tractable for apps with
+ * more than a couple of contracts.
+ */
+function contractsApprovals(layers: string[][] | undefined): DeployApproval[] {
+    if (!layers || layers.length === 0) return [];
+    const approvals: DeployApproval[] = [];
+    layers.forEach((layer, idx) => {
+        const layerLabel = layers.length > 1 ? ` (layer ${idx + 1}/${layers.length})` : "";
+        const preview = summarizeCrates(layer);
+        approvals.push(
+            {
+                phase: "contracts",
+                label: `Deploy + register contracts${layerLabel}: ${preview}`,
+            },
+            {
+                phase: "contracts",
+                label: `Publish metadata${layerLabel}: ${preview}`,
+            },
+        );
+    });
+    return approvals;
+}
+
+function summarizeCrates(crates: string[]): string {
+    if (crates.length <= 3) return crates.join(", ");
+    return `${crates.slice(0, 3).join(", ")} +${crates.length - 3} more`;
+}
+
 export function resolveSignerSetup(opts: ResolveOptions): DeploySignerSetup {
     const approvals: DeployApproval[] = [];
 
     let bulletinDeployAuthOptions: DeploySignerSetup["bulletinDeployAuthOptions"] = {};
+
+    // Contracts run *before* the frontend build in `runDeploy`, so their
+    // approvals land first in the list — the phone counter counts them in
+    // the order the user actually sees them.
+    if (opts.mode === "phone") {
+        approvals.push(...contractsApprovals(opts.contractLayers));
+    }
 
     if (opts.mode === "phone") {
         if (!opts.userSigner) {

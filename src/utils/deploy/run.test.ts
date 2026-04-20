@@ -99,7 +99,7 @@ describe("runDeploy", () => {
         expect(publishToPlaygroundMock).not.toHaveBeenCalled();
 
         const plan = events.find((e) => e.kind === "plan");
-        expect(plan).toEqual({ kind: "plan", approvals: [] });
+        expect(plan).toEqual({ kind: "plan", approvals: [], contractLayers: [] });
 
         // bulletin-deploy auth must be empty in dev mode.
         expect(runStorageDeploy).toHaveBeenCalledTimes(1);

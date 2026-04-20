@@ -17,19 +17,37 @@ import {
     type SigningCounter,
     type SigningEvent,
 } from "./signingProxy.js";
+import {
+    planContracts,
+    runContractDeploy,
+    runCdmInstall,
+    freshlyDeployedPackages,
+    type CdmDeployEvent,
+    type ContractsPlan,
+} from "./contracts.js";
 import type { DeployLogEvent } from "./progress.js";
 import type { ResolvedSigner } from "../signer.js";
 import type { Env } from "../../config.js";
 import type { DeployPlan } from "./availability.js";
+import { getConnection } from "../connection.js";
 
 // ── Events ───────────────────────────────────────────────────────────────────
 
-export type DeployPhase = "build" | "storage-and-dotns" | "playground" | "done";
+export type DeployPhase =
+    | "contracts"
+    | "cdm-install"
+    | "build"
+    | "storage-and-dotns"
+    | "playground"
+    | "done";
 
 export type DeployEvent =
-    | { kind: "plan"; approvals: DeployApproval[] }
+    | { kind: "plan"; approvals: DeployApproval[]; contractLayers: string[][] }
     | { kind: "phase-start"; phase: DeployPhase }
     | { kind: "phase-complete"; phase: DeployPhase }
+    | { kind: "phase-skipped"; phase: DeployPhase; reason: string }
+    | { kind: "contracts-event"; event: CdmDeployEvent }
+    | { kind: "cdm-install-log"; line: string }
     | { kind: "build-log"; line: string }
     | { kind: "build-detected"; config: BuildConfig }
     | { kind: "storage-event"; event: DeployLogEvent }
@@ -78,6 +96,12 @@ export interface DeployOutcome {
     approvalsRequested: DeployApproval[];
     /** URL the user can visit to view their deployed app. */
     appUrl: string;
+    /**
+     * cdm packages that were freshly deployed this run (i.e. not cached from a
+     * prior deploy). Consumers can use this for summary UI; runDeploy has
+     * already refreshed the project's `cdm.json` via `cdm i` for them.
+     */
+    freshContractPackages?: string[];
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -85,16 +109,89 @@ export interface DeployOutcome {
 export async function runDeploy(options: RunDeployOptions): Promise<DeployOutcome> {
     const { label, fullDomain } = normalizeDomain(options.domain);
 
+    // Scan for contracts up-front so the approvals list can include them in
+    // the right slot before we render the summary card / phone counter.
+    const contractsPlan: ContractsPlan | null = planContracts(options.projectDir);
+
     const setup = resolveSignerSetup({
         mode: options.mode,
         userSigner: options.userSigner,
         publishToPlayground: options.publishToPlayground,
         plan: options.plan,
+        contractLayers: contractsPlan?.layers,
     });
 
-    options.onEvent({ kind: "plan", approvals: setup.approvals });
+    options.onEvent({
+        kind: "plan",
+        approvals: setup.approvals,
+        contractLayers: contractsPlan?.layers ?? [],
+    });
 
     const counter = createSigningCounter(setup.approvals.length);
+
+    // ── Contracts ────────────────────────────────────────────────────────
+    // Runs BEFORE the frontend build so the build can read fresh addresses
+    // from `cdm.json` (updated by `cdm i` further down). No-op when the
+    // project has no ink! contracts.
+    let freshContractPackages: string[] | undefined;
+    if (contractsPlan) {
+        if (options.mode !== "phone" || !options.userSigner) {
+            // Contracts can't deploy without the user's signer — the cdm
+            // pipeline has no concept of a dev fallback mnemonic.
+            options.onEvent({
+                kind: "phase-skipped",
+                phase: "contracts",
+                reason: "Contract deploys require --signer phone (logged-in account). Contracts were detected but will be skipped.",
+            });
+        } else {
+            options.onEvent({ kind: "phase-start", phase: "contracts" });
+            try {
+                const client = await getConnection();
+                const wrappedSigner = wrapSignerForContracts(
+                    options.userSigner.signer,
+                    counter,
+                    setup.approvals,
+                    (event) => options.onEvent({ kind: "signing", event }),
+                );
+                const summary = await runContractDeploy({
+                    rootDir: options.projectDir,
+                    client,
+                    signer: wrappedSigner,
+                    origin: options.userSigner.address,
+                    onEvent: (event) => options.onEvent({ kind: "contracts-event", event }),
+                });
+                freshContractPackages = freshlyDeployedPackages(summary);
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                options.onEvent({ kind: "error", phase: "contracts", message });
+                throw err;
+            }
+            options.onEvent({ kind: "phase-complete", phase: "contracts" });
+
+            // ── cdm install (refresh cdm.json with fresh addresses) ──────
+            if (freshContractPackages && freshContractPackages.length > 0) {
+                options.onEvent({ kind: "phase-start", phase: "cdm-install" });
+                try {
+                    await runCdmInstall({
+                        cwd: options.projectDir,
+                        packages: freshContractPackages,
+                        onLine: (line) => options.onEvent({ kind: "cdm-install-log", line }),
+                    });
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    options.onEvent({ kind: "error", phase: "cdm-install", message });
+                    throw err;
+                }
+                options.onEvent({ kind: "phase-complete", phase: "cdm-install" });
+            } else {
+                options.onEvent({
+                    kind: "phase-skipped",
+                    phase: "cdm-install",
+                    reason: "all contracts already up-to-date",
+                });
+            }
+        }
+    }
 
     // ── Build ────────────────────────────────────────────────────────────
     const buildAbs = options.buildDir;
@@ -178,6 +275,7 @@ export async function runDeploy(options: RunDeployOptions): Promise<DeployOutcom
         metadataCid,
         approvalsRequested: setup.approvals,
         appUrl,
+        freshContractPackages,
     };
     options.onEvent({ kind: "phase-complete", phase: "done" });
     return outcome;
@@ -232,6 +330,39 @@ function maybeWrapAuthForSigning(
     };
 
     return { ...auth, signer: wrapped };
+}
+
+/**
+ * Wrap the user's signer for the cdm deploy phase. Each `signTx` call is
+ * paired with the next "contracts" approval label in `setup.approvals`, so
+ * the phone counter advances in lockstep with what the user is approving —
+ * "Deploy + register contracts (layer 1/2): foo, bar" first, "Publish
+ * metadata (layer 1/2): foo, bar" second, then layer 2, etc. `signBytes` is
+ * not part of any cdm flow today but we forward it just in case.
+ */
+function wrapSignerForContracts(
+    inner: import("polkadot-api").PolkadotSigner,
+    counter: SigningCounter,
+    approvals: DeployApproval[],
+    onEvent: (event: SigningEvent) => void,
+) {
+    const labels = approvals.filter((a) => a.phase === "contracts").map((a) => a.label);
+    const fallbackLabel = labels[labels.length - 1] ?? "Contracts step";
+    let seen = 0;
+    return {
+        publicKey: inner.publicKey,
+        signTx: (...args: Parameters<typeof inner.signTx>) => {
+            const label = labels[seen] ?? fallbackLabel;
+            seen += 1;
+            return wrapSignerWithEvents(inner, { label, counter, onEvent }).signTx(...args);
+        },
+        signBytes: (data: Parameters<typeof inner.signBytes>[0]) =>
+            wrapSignerWithEvents(inner, {
+                label: "Contracts signBytes",
+                counter,
+                onEvent,
+            }).signBytes(data),
+    };
 }
 
 function wrapResolvedSigner(

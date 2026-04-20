@@ -27,6 +27,7 @@ import {
     type SigningEvent,
 } from "../../utils/deploy/index.js";
 import { buildSummaryView } from "./summary.js";
+import { ContractRow, applyContractEvent, type ContractRowState } from "./ContractRow.js";
 import type { ResolvedSigner } from "../../utils/signer.js";
 import { DEFAULT_BUILD_DIR } from "../../config.js";
 import { VERSION_LABEL } from "../../utils/version.js";
@@ -428,9 +429,18 @@ interface PhaseState {
     detail?: string;
 }
 
-const PHASE_ORDER: DeployPhase[] = ["build", "storage-and-dotns", "playground", "done"];
+const PHASE_ORDER: DeployPhase[] = [
+    "contracts",
+    "cdm-install",
+    "build",
+    "storage-and-dotns",
+    "playground",
+    "done",
+];
 const PHASE_TITLE: Record<DeployPhase, string> = {
-    build: "build",
+    contracts: "contracts",
+    "cdm-install": "refresh cdm.json",
+    build: "build frontend",
     "storage-and-dotns": "upload + dotns",
     playground: "publish to playground",
     done: "done",
@@ -464,7 +474,12 @@ function RunningStage({
     onFinish: (outcome: DeployOutcome, chunkTimings: number[]) => void;
     onError: (message: string) => void;
 }) {
+    // Contract and cdm-install phases start "pending" optimistically and get
+    // collapsed to "complete" + skipped=true when the orchestrator fires
+    // `phase-skipped` (e.g. no ink! crates detected, or nothing to reinstall).
     const initialPhases: Record<DeployPhase, PhaseState> = {
+        contracts: { status: "pending" },
+        "cdm-install": { status: "pending" },
         build: { status: "pending" },
         "storage-and-dotns": { status: "pending" },
         playground: {
@@ -474,6 +489,7 @@ function RunningStage({
         done: { status: "pending" },
     };
     const [phases, setPhases] = useState(initialPhases);
+    const [contractRows, setContractRows] = useState<Record<string, ContractRowState>>({});
     const [signingPrompt, setSigningPrompt] = useState<SigningEvent | null>(null);
     const [latestInfo, setLatestInfo] = useState<string | null>(null);
 
@@ -537,7 +553,11 @@ function RunningStage({
         function handleEvent(event: DeployEvent) {
             if (event.kind === "phase-start") {
                 setPhases((p) => ({ ...p, [event.phase]: { status: "running" } }));
-                if (event.phase === "storage-and-dotns") {
+                if (event.phase === "contracts") {
+                    setWindowTitle(`dot deploy · ${inputs.domain} · contracts`);
+                } else if (event.phase === "cdm-install") {
+                    setWindowTitle(`dot deploy · ${inputs.domain} · cdm install`);
+                } else if (event.phase === "storage-and-dotns") {
                     setWindowTitle(`dot deploy · ${inputs.domain} · uploading`);
                 } else if (event.phase === "playground") {
                     setWindowTitle(`dot deploy · ${inputs.domain} · publishing`);
@@ -546,6 +566,16 @@ function RunningStage({
                 }
             } else if (event.kind === "phase-complete") {
                 setPhases((p) => ({ ...p, [event.phase]: { status: "complete" } }));
+            } else if (event.kind === "phase-skipped") {
+                setPhases((p) => ({
+                    ...p,
+                    [event.phase]: { status: "complete", detail: "skipped" },
+                }));
+                queueInfo(event.reason);
+            } else if (event.kind === "contracts-event") {
+                applyContractEvent(setContractRows, event.event, queueInfo);
+            } else if (event.kind === "cdm-install-log") {
+                queueInfo(event.line);
             } else if (event.kind === "build-log") {
                 queueInfo(event.line);
             } else if (event.kind === "build-detected") {
@@ -589,6 +619,11 @@ function RunningStage({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
+    const contractCrates = Object.keys(contractRows);
+    const contractsPhaseActive =
+        phases.contracts.status === "running" ||
+        (phases.contracts.status === "complete" && contractCrates.length > 0);
+
     return (
         <Box flexDirection="column">
             <Section gapBelow={false}>
@@ -605,6 +640,15 @@ function RunningStage({
                     );
                 })}
             </Section>
+
+            {contractsPhaseActive && contractCrates.length > 0 && (
+                <Box marginTop={1} flexDirection="column">
+                    <Hint indent={2}>contracts</Hint>
+                    {contractCrates.map((crate) => (
+                        <ContractRow key={crate} name={crate} state={contractRows[crate]} />
+                    ))}
+                </Box>
+            )}
 
             {latestInfo && (
                 <Box marginTop={1}>

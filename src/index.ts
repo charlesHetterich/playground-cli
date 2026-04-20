@@ -4,7 +4,7 @@ import { Command } from "commander";
 import pkg from "../package.json" with { type: "json" };
 import { initCommand } from "./commands/init/index.js";
 import { modCommand } from "./commands/mod/index.js";
-import { buildCommand } from "./commands/build.js";
+import { buildCommand } from "./commands/build/index.js";
 import { deployCommand } from "./commands/deploy/index.js";
 import { updateCommand } from "./commands/update.js";
 import { installSignalHandlers, onProcessShutdown } from "./utils/process-guard.js";
