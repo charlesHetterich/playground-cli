@@ -117,7 +117,7 @@ describe("adaptSignPayload", () => {
 
     it("throws a readable error when the session returns Err", async () => {
         const { run } = payloadAdapter(() => err(new Error("user rejected")));
-        await expect(run(basePayload())).rejects.toThrow(/Mobile signing rejected: user rejected/);
+        await expect(run(basePayload())).rejects.toThrow(/Mobile signing failed.*user rejected/);
     });
 
     it("throws an upgrade-guidance error when signedTransaction is missing", async () => {
@@ -213,7 +213,7 @@ describe("adaptSignRaw", () => {
         // biome-ignore lint/suspicious/noExplicitAny: duck-typed fake session
         const adapter = adaptSignRaw(fakeSession as any);
         await expect(adapter({ address: "5F...", data: "0x00", type: "bytes" })).rejects.toThrow(
-            /Mobile signing rejected: session closed/,
+            /Mobile signing failed.*session closed/,
         );
     });
 });

@@ -25,6 +25,8 @@ import {
     type CdmDeployEvent,
     type ContractsPlan,
 } from "./contracts.js";
+import { createDevSigner } from "@polkadot-apps/tx";
+import { ss58Encode } from "@polkadot-apps/address";
 import type { DeployLogEvent } from "./progress.js";
 import type { ResolvedSigner } from "../signer.js";
 import type { Env } from "../../config.js";
@@ -133,63 +135,65 @@ export async function runDeploy(options: RunDeployOptions): Promise<DeployOutcom
     // Runs BEFORE the frontend build so the build can read fresh addresses
     // from `cdm.json` (updated by `cdm i` further down). No-op when the
     // project has no ink! contracts.
+    //
+    // FIXME(mobile-signer-contracts): Revive.instantiate_with_code ships the
+    // PVM bytecode inline (~100 KB), which exceeds the host-terminal session
+    // transport's message-size limit ("message too big" from the mobile app).
+    // Until @polkadot-apps/terminal lifts that cap, we sign contract deploys
+    // with a local Alice dev signer. The phone signer is still used for
+    // DotNS + playground publish below, so app ownership still records under
+    // the user's address — only the on-chain contract addresses / registry
+    // entries will record Alice as the deployer.
+    //
+    // To revert: (1) gate this block on `options.mode === "phone" &&
+    // options.userSigner`, (2) swap `createDevSigner("Alice")` for the
+    // user's signer wrapped via `wrapSignerWithLabeledSteps(...)` from
+    // signingProxy.ts — pass `setup.approvals.filter(a => a.phase ===
+    // "contracts").map(a => a.label)` as labels, and (3) re-enable the
+    // matching `approvals.push(...contractsApprovals(...))` in signerMode.ts.
     let freshContractPackages: string[] | undefined;
     if (contractsPlan) {
-        if (options.mode !== "phone" || !options.userSigner) {
-            // Contracts can't deploy without the user's signer — the cdm
-            // pipeline has no concept of a dev fallback mnemonic.
-            options.onEvent({
-                kind: "phase-skipped",
-                phase: "contracts",
-                reason: "Contract deploys require --signer phone (logged-in account). Contracts were detected but will be skipped.",
+        options.onEvent({ kind: "phase-start", phase: "contracts" });
+        try {
+            const client = await getConnection();
+            const aliceSigner = createDevSigner("Alice");
+            const aliceAddress = ss58Encode(aliceSigner.publicKey);
+            const summary = await runContractDeploy({
+                rootDir: options.projectDir,
+                client,
+                signer: aliceSigner,
+                origin: aliceAddress,
+                onEvent: (event) => options.onEvent({ kind: "contracts-event", event }),
             });
-        } else {
-            options.onEvent({ kind: "phase-start", phase: "contracts" });
+            freshContractPackages = freshlyDeployedPackages(summary);
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            options.onEvent({ kind: "error", phase: "contracts", message });
+            throw err;
+        }
+        options.onEvent({ kind: "phase-complete", phase: "contracts" });
+
+        // ── cdm install (refresh cdm.json with fresh addresses) ──────
+        if (freshContractPackages && freshContractPackages.length > 0) {
+            options.onEvent({ kind: "phase-start", phase: "cdm-install" });
             try {
-                const client = await getConnection();
-                const wrappedSigner = wrapSignerForContracts(
-                    options.userSigner.signer,
-                    counter,
-                    setup.approvals,
-                    (event) => options.onEvent({ kind: "signing", event }),
-                );
-                const summary = await runContractDeploy({
-                    rootDir: options.projectDir,
-                    client,
-                    signer: wrappedSigner,
-                    origin: options.userSigner.address,
-                    onEvent: (event) => options.onEvent({ kind: "contracts-event", event }),
+                await runCdmInstall({
+                    cwd: options.projectDir,
+                    packages: freshContractPackages,
+                    onLine: (line) => options.onEvent({ kind: "cdm-install-log", line }),
                 });
-                freshContractPackages = freshlyDeployedPackages(summary);
             } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
-                options.onEvent({ kind: "error", phase: "contracts", message });
+                options.onEvent({ kind: "error", phase: "cdm-install", message });
                 throw err;
             }
-            options.onEvent({ kind: "phase-complete", phase: "contracts" });
-
-            // ── cdm install (refresh cdm.json with fresh addresses) ──────
-            if (freshContractPackages && freshContractPackages.length > 0) {
-                options.onEvent({ kind: "phase-start", phase: "cdm-install" });
-                try {
-                    await runCdmInstall({
-                        cwd: options.projectDir,
-                        packages: freshContractPackages,
-                        onLine: (line) => options.onEvent({ kind: "cdm-install-log", line }),
-                    });
-                } catch (err) {
-                    const message = err instanceof Error ? err.message : String(err);
-                    options.onEvent({ kind: "error", phase: "cdm-install", message });
-                    throw err;
-                }
-                options.onEvent({ kind: "phase-complete", phase: "cdm-install" });
-            } else {
-                options.onEvent({
-                    kind: "phase-skipped",
-                    phase: "cdm-install",
-                    reason: "all contracts already up-to-date",
-                });
-            }
+            options.onEvent({ kind: "phase-complete", phase: "cdm-install" });
+        } else {
+            options.onEvent({
+                kind: "phase-skipped",
+                phase: "cdm-install",
+                reason: "all contracts already up-to-date",
+            });
         }
     }
 
@@ -330,39 +334,6 @@ function maybeWrapAuthForSigning(
     };
 
     return { ...auth, signer: wrapped };
-}
-
-/**
- * Wrap the user's signer for the cdm deploy phase. Each `signTx` call is
- * paired with the next "contracts" approval label in `setup.approvals`, so
- * the phone counter advances in lockstep with what the user is approving —
- * "Deploy + register contracts (layer 1/2): foo, bar" first, "Publish
- * metadata (layer 1/2): foo, bar" second, then layer 2, etc. `signBytes` is
- * not part of any cdm flow today but we forward it just in case.
- */
-function wrapSignerForContracts(
-    inner: import("polkadot-api").PolkadotSigner,
-    counter: SigningCounter,
-    approvals: DeployApproval[],
-    onEvent: (event: SigningEvent) => void,
-) {
-    const labels = approvals.filter((a) => a.phase === "contracts").map((a) => a.label);
-    const fallbackLabel = labels[labels.length - 1] ?? "Contracts step";
-    let seen = 0;
-    return {
-        publicKey: inner.publicKey,
-        signTx: (...args: Parameters<typeof inner.signTx>) => {
-            const label = labels[seen] ?? fallbackLabel;
-            seen += 1;
-            return wrapSignerWithEvents(inner, { label, counter, onEvent }).signTx(...args);
-        },
-        signBytes: (data: Parameters<typeof inner.signBytes>[0]) =>
-            wrapSignerWithEvents(inner, {
-                label: "Contracts signBytes",
-                counter,
-                onEvent,
-            }).signBytes(data),
-    };
 }
 
 function wrapResolvedSigner(

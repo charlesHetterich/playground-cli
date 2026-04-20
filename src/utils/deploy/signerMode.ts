@@ -144,12 +144,13 @@ export function resolveSignerSetup(opts: ResolveOptions): DeploySignerSetup {
 
     let bulletinDeployAuthOptions: DeploySignerSetup["bulletinDeployAuthOptions"] = {};
 
-    // Contracts run *before* the frontend build in `runDeploy`, so their
-    // approvals land first in the list — the phone counter counts them in
-    // the order the user actually sees them.
-    if (opts.mode === "phone") {
-        approvals.push(...contractsApprovals(opts.contractLayers));
-    }
+    // FIXME(mobile-signer-contracts): contract deploys currently use a local
+    // Alice dev signer (see runDeploy in run.ts) because the host-terminal
+    // transport caps message size below the PVM bytecode payload. Once that
+    // limit is lifted, restore `approvals.push(...contractsApprovals(...))`
+    // here and thread the phone signer back through runContractDeploy.
+    void opts.contractLayers;
+    void contractsApprovals;
 
     if (opts.mode === "phone") {
         if (!opts.userSigner) {

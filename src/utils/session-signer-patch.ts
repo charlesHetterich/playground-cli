@@ -63,7 +63,9 @@ export function adaptSignPayload(session: Pick<UserSession, "signPayload">): (
         });
 
         if (result.isErr()) {
-            throw new Error(`Mobile signing rejected: ${result.error.message}`);
+            throw new Error(
+                `Mobile signing failed (${result.error.name ?? "error"}): ${result.error.message}`,
+            );
         }
 
         if (!result.value.signedTransaction) {
@@ -95,7 +97,8 @@ export function adaptSignRaw(session: Pick<UserSession, "signRaw">): (payload: {
         });
 
         if (result.isErr()) {
-            throw new Error(`Mobile signing rejected: ${result.error.message}`);
+            const name = result.error.name ?? "error";
+            throw new Error(`Mobile signing failed (${name}): ${result.error.message}`);
         }
 
         return { id: 0, signature: toHex(result.value.signature) };
